@@ -16,6 +16,7 @@ Conventions
   test start, and test windows start at least LOOKBACK hours after the test start.
   No input or target window crosses the train/test boundary.
 """
+
 from __future__ import annotations
 
 import json
@@ -30,18 +31,18 @@ import torch.nn as nn
 from numpy.lib.stride_tricks import sliding_window_view
 
 SERIES = ["TS0277", "TS3423", "TS3449", "TS4011"]
-L_IN = 168        # dynamic input length: one week of hourly values
-H = 24            # forecast horizon: 1..24 hours ahead
-LOOKBACK = 672    # history used for static features: 28 days
+L_IN = 168  # dynamic input length: one week of hourly values
+H = 24  # forecast horizon: 1..24 hours ahead
+LOOKBACK = 672  # history used for static features: 28 days
 VAL_DAYS = 60
 
 
-# ----------------------------------------------------------------------------- data
+# Data loading and feature engineering
 def load_raw(path: str) -> pd.Series:
     df = pd.read_csv(path, header=None, names=["t", "y"], parse_dates=["t"])
-    s = df.groupby("t")["y"].mean()                               # DST duplicates
+    s = df.groupby("t")["y"].mean()  # DST duplicates
     grid = pd.date_range(s.index.min(), s.index.max(), freq="15min")
-    return s.reindex(grid).interpolate(limit_direction="both")    # DST gaps
+    return s.reindex(grid).interpolate(limit_direction="both")  # DST gaps
 
 
 def load_hourly(data_dir: str, name: str) -> pd.Series:
@@ -53,10 +54,15 @@ def load_hourly(data_dir: str, name: str) -> pd.Series:
 def calendar_dynamic(idx: pd.DatetimeIndex) -> np.ndarray:
     """Per-hour calendar encoding (sin/cos of hour, weekday, day of year + weekend flag)."""
     hour, dow, doy = idx.hour.values, idx.dayofweek.values, idx.dayofyear.values
-    f = [np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24),
-         np.sin(2 * np.pi * dow / 7), np.cos(2 * np.pi * dow / 7),
-         np.sin(2 * np.pi * doy / 365.25), np.cos(2 * np.pi * doy / 365.25),
-         (dow >= 5).astype(float)]
+    f = [
+        np.sin(2 * np.pi * hour / 24),
+        np.cos(2 * np.pi * hour / 24),
+        np.sin(2 * np.pi * dow / 7),
+        np.cos(2 * np.pi * dow / 7),
+        np.sin(2 * np.pi * doy / 365.25),
+        np.cos(2 * np.pi * doy / 365.25),
+        (dow >= 5).astype(float),
+    ]
     return np.stack(f, 1).astype(np.float32)
 
 
@@ -68,43 +74,51 @@ def static_features(y: np.ndarray, idx: pd.DatetimeIndex, t0s: np.ndarray) -> tu
 
     y must already be normalized by the training mean.
     """
-    win = sliding_window_view(y, LOOKBACK)[t0s - LOOKBACK]        # (n, 672), window ends at t0-1
+    win = sliding_window_view(y, LOOKBACK)[t0s - LOOKBACK]  # (n, 672), window ends at t0-1
     n = len(t0s)
     feats, names = [], []
 
     # 1) calendar of the first forecast step
     cal = calendar_dynamic(idx[t0s])
-    feats.append(cal); names += [f"t0_{c}" for c in CAL_NAMES]
+    feats.append(cal)
+    names += [f"t0_{c}" for c in CAL_NAMES]
 
     # 2) aggregates over the last 28 days / 7 days / 1 day
     days = win.reshape(n, 28, 24)
-    daily_mean = days.mean(2)                                      # (n, 28)
-    aggr = np.stack([win.mean(1), win.std(1), win[:, -168:].mean(1), win[:, -24:].mean(1),
-                     win[:, -24:].std(1), daily_mean.std(1)], 1)
-    feats.append(aggr); names += ["mean_28d", "std_28d", "mean_7d", "mean_1d", "std_1d", "std_daily_means_28d"]
+    daily_mean = days.mean(2)  # (n, 28)
+    aggr = np.stack(
+        [win.mean(1), win.std(1), win[:, -168:].mean(1), win[:, -24:].mean(1), win[:, -24:].std(1), daily_mean.std(1)],
+        1,
+    )
+    feats.append(aggr)
+    names += ["mean_28d", "std_28d", "mean_7d", "mean_1d", "std_1d", "std_daily_means_28d"]
 
     # 3) percentiles of the last 28 days
     q = [0, 10, 20, 40, 60, 80, 90, 100]
-    feats.append(np.percentile(win, q, axis=1).T); names += [f"p{p}_28d" for p in q]
+    feats.append(np.percentile(win, q, axis=1).T)
+    names += [f"p{p}_28d" for p in q]
 
     # 4) trend: slope of the daily means (per day) and ratio of last week vs previous 3 weeks
     x = np.arange(28) - 13.5
-    slope = (daily_mean * x).sum(1) / (x ** 2).sum()
+    slope = (daily_mean * x).sum(1) / (x**2).sum()
     ratio = daily_mean[:, -7:].mean(1) / (daily_mean[:, :-7].mean(1) + 1e-3)
-    feats.append(np.stack([slope, ratio], 1)); names += ["trend_slope_28d", "ratio_7d_vs_prev21d"]
+    feats.append(np.stack([slope, ratio], 1))
+    names += ["trend_slope_28d", "ratio_7d_vs_prev21d"]
 
     # 5) average daily profile over 28 days, aligned so that profile[k] is the
     #    typical value k hours after t0's hour-of-day (LOOKBACK is a multiple of 24)
     prof = days.mean(1)
-    feats.append(prof); names += [f"profile_h{k}" for k in range(24)]
+    feats.append(prof)
+    names += [f"profile_h{k}" for k in range(24)]
 
     # 6) weekday / weekend contrast over the lookback window
-    wd = idx[t0s - LOOKBACK].dayofweek.values                     # weekday of first lookback day
+    wd = idx[t0s - LOOKBACK].dayofweek.values  # weekday of first lookback day
     dow_days = (wd[:, None] + np.arange(28)[None]) % 7
     is_we = dow_days >= 5
     we = (daily_mean * is_we).sum(1) / is_we.sum(1)
     wk = (daily_mean * ~is_we).sum(1) / (~is_we).sum(1)
-    feats.append(np.stack([we / (wk + 1e-3)], 1)); names += ["weekend_weekday_ratio"]
+    feats.append(np.stack([we / (wk + 1e-3)], 1))
+    names += ["weekend_weekday_ratio"]
 
     return np.concatenate(feats, 1).astype(np.float32), names
 
@@ -114,11 +128,11 @@ class SeriesData:
     name: str
     hourly: pd.Series
     mean: float
-    y: np.ndarray            # normalized consumption
-    cal: np.ndarray          # (N, 7) calendar dynamic features
+    y: np.ndarray  # normalized consumption
+    cal: np.ndarray  # (N, 7) calendar dynamic features
     test_start: int
     val_start: int
-    t0: dict = field(default_factory=dict)   # split -> forecast origins
+    t0: dict = field(default_factory=dict)  # split -> forecast origins
     static: dict = field(default_factory=dict)
 
 
@@ -128,13 +142,13 @@ def prepare(data_dir: str, name: str) -> SeriesData:
     test_start_ts = idx[-1] + pd.Timedelta(hours=1) - pd.Timedelta(days=365)
     test_start = int(np.searchsorted(idx, test_start_ts))
     val_start = test_start - VAL_DAYS * 24
-    mean = float(h.values[:test_start].mean())                    # training data only
+    mean = float(h.values[:test_start].mean())  # training data only
     y = (h.values / mean).astype(np.float32)
     d = SeriesData(name, h, mean, y, calendar_dynamic(idx), test_start, val_start)
     N = len(y)
     d.t0["train"] = np.arange(LOOKBACK, val_start - H + 1)
-    d.t0["val"] = np.arange(max(val_start, LOOKBACK), test_start - H + 1)   # lookback may use train history
-    d.t0["test"] = np.arange(test_start + LOOKBACK, N - H + 1)              # strictly inside the test year
+    d.t0["val"] = np.arange(max(val_start, LOOKBACK), test_start - H + 1)  # lookback may use train history
+    d.t0["test"] = np.arange(test_start + LOOKBACK, N - H + 1)  # strictly inside the test year
     for k, t0s in d.t0.items():
         d.static[k], _ = static_features(y, idx, t0s)
     return d
@@ -144,7 +158,7 @@ def static_names(d: SeriesData) -> list[str]:
     return static_features(d.y, d.hourly.index, d.t0["test"][:1])[1]
 
 
-# ---------------------------------------------------------------------------- models
+# Models
 class Forecaster(nn.Module):
     """LSTM encoder -> MLP head predicting H future values at once.
 
@@ -162,18 +176,17 @@ class Forecaster(nn.Module):
                re-weights the dynamic channels instead of only being appended.
     """
 
-    def __init__(self, n_dyn, n_static=0, static_mode="none", hidden=64, layers=1, latent=32,
-                 dropout=0.1):
+    def __init__(self, n_dyn, n_static=0, static_mode="none", hidden=64, layers=1, latent=32, dropout=0.1):
         super().__init__()
         self.mode, self.hidden, self.layers = static_mode, hidden, layers
         rnn_in = n_dyn + (n_static if static_mode == "seq" else 0)
-        self.lstm = nn.LSTM(rnn_in, hidden, layers, batch_first=True,
-                            dropout=dropout if layers > 1 else 0.0)
+        self.lstm = nn.LSTM(rnn_in, hidden, layers, batch_first=True, dropout=dropout if layers > 1 else 0.0)
         if static_mode == "film":
             self.film_in = nn.Linear(latent, 2 * n_dyn)
             self.film_out = nn.Linear(latent, 2 * hidden)
-            for l in (self.film_in, self.film_out):   # start as identity modulation
-                nn.init.zeros_(l.weight); nn.init.zeros_(l.bias)
+            for l in (self.film_in, self.film_out):  # start as identity modulation
+                nn.init.zeros_(l.weight)
+                nn.init.zeros_(l.bias)
         if static_mode in ("concat", "init", "hybrid", "film"):
             self.enc = nn.Sequential(nn.Linear(n_static, latent), nn.ReLU(), nn.Linear(latent, latent), nn.Tanh())
         if static_mode in ("init", "hybrid", "film"):
@@ -185,7 +198,8 @@ class Forecaster(nn.Module):
         # to the weekly seasonal-naive forecast y[t0+k-168]; the LSTM branch learns the correction.
         self.skip = nn.Linear(L_IN, H)
         with torch.no_grad():
-            self.skip.weight.zero_(); self.skip.bias.zero_()
+            self.skip.weight.zero_()
+            self.skip.bias.zero_()
             self.skip.weight[torch.arange(H), torch.arange(H)] = 1.0
 
     def _init_state(self, z):
@@ -196,7 +210,7 @@ class Forecaster(nn.Module):
 
     def forward(self, x, s=None):
         m = self.mode
-        base = self.skip(x[:, :, 0])            # channel 0 is always the consumption
+        base = self.skip(x[:, :, 0])  # channel 0 is always the consumption
         if m == "seq":
             x = torch.cat([x, s[:, None, :].expand(-1, x.shape[1], -1)], 2)
         z = self.enc(s) if hasattr(self, "enc") else None
@@ -214,7 +228,7 @@ class Forecaster(nn.Module):
         return base + self.head(last)
 
 
-# --------------------------------------------------------------------------- batching
+# Batching
 class Pool:
     """Concatenates several series so that one model can be trained on all of them."""
 
@@ -225,7 +239,9 @@ class Pool:
         for d in series:
             self.offset.append(off)
             f = d.y[:, None] if not use_cal else np.concatenate([d.y[:, None], d.cal], 1)
-            dyn.append(f); ys.append(d.y); off += len(d.y)
+            dyn.append(f)
+            ys.append(d.y)
+            off += len(d.y)
         self.dyn = torch.from_numpy(np.concatenate(dyn)).float()
         self.y = torch.from_numpy(np.concatenate(ys)).float()
         self.n_dyn = self.dyn.shape[1]
@@ -246,43 +262,61 @@ class Pool:
         return self.dyn[xi], s, self.y[yi]
 
 
-# --------------------------------------------------------------------------- training
+# Training
 def predict(model, pool, g, s, bs=2048):
-    model.eval(); out = []
+    model.eval()
+    out = []
     with torch.no_grad():
         for i in range(0, len(g), bs):
-            x, ss, _ = pool.batch(g[i:i + bs], s[i:i + bs])
+            x, ss, _ = pool.batch(g[i : i + bs], s[i : i + bs])
             out.append(model(x, ss))
     return torch.cat(out).numpy()
 
 
-def train_model(pool: Pool, static_mode="none", epochs=15, patience=4, bs=256, lr=2e-3,
-                seed=0, stride=3, max_train=None, verbose=True, **kw):
+def train_model(
+    pool: Pool,
+    static_mode="none",
+    epochs=15,
+    patience=4,
+    bs=256,
+    lr=2e-3,
+    seed=0,
+    stride=3,
+    max_train=None,
+    verbose=True,
+    **kw,
+):
     """Adam + MSE, ReduceLROnPlateau, early stopping on the validation period.
 
     stride: use every `stride`-th forecast origin for training (neighbouring hourly windows
     are almost identical, so this cuts the cost with little loss of information).
     """
-    torch.manual_seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     model = Forecaster(pool.n_dyn, pool.n_static, static_mode, **kw)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=2)
-    gtr, str_ = pool.split("train"); gva, sva = pool.split("val")
+    gtr, str_ = pool.split("train")
+    gva, sva = pool.split("val")
     gtr, str_ = gtr[::stride], str_[::stride]
     yva = pool.y[gva[:, None] + torch.arange(H)[None]].numpy()
     best, best_state, wait, hist = np.inf, None, 0, []
     for ep in range(epochs):
-        t = time.time(); model.train()
+        t = time.time()
+        model.train()
         perm = torch.randperm(len(gtr))
-        if max_train: perm = perm[:max_train]
+        if max_train:
+            perm = perm[:max_train]
         tot = 0.0
         for i in range(0, len(perm), bs):
-            b = perm[i:i + bs]
+            b = perm[i : i + bs]
             x, s, y = pool.batch(gtr[b], str_[b])
             loss = nn.functional.mse_loss(model(x, s), y)
-            opt.zero_grad(); loss.backward()
+            opt.zero_grad()
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); tot += loss.item() * len(b)
+            opt.step()
+            tot += loss.item() * len(b)
         val = float(((predict(model, pool, gva, sva) - yva) ** 2).mean())
         sched.step(val)
         hist.append((tot / len(perm), val))
@@ -293,7 +327,8 @@ def train_model(pool: Pool, static_mode="none", epochs=15, patience=4, bs=256, l
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
         else:
             wait += 1
-            if wait >= patience: break
+            if wait >= patience:
+                break
     model.load_state_dict(best_state)
     return model, hist
 
@@ -312,9 +347,7 @@ def evaluate(model, pool: Pool, split="test") -> dict[str, pd.DataFrame]:
 
 def horizon_metrics(p: np.ndarray, y: np.ndarray) -> pd.DataFrame:
     e = p - y
-    return pd.DataFrame({"horizon": np.arange(1, H + 1),
-                         "RMSE": np.sqrt((e ** 2).mean(0)),
-                         "MAE": np.abs(e).mean(0)})
+    return pd.DataFrame({"horizon": np.arange(1, H + 1), "RMSE": np.sqrt((e**2).mean(0)), "MAE": np.abs(e).mean(0)})
 
 
 def naive_metrics(d: SeriesData, lag: int, split="test") -> pd.DataFrame:
@@ -325,16 +358,19 @@ def naive_metrics(d: SeriesData, lag: int, split="test") -> pd.DataFrame:
 
 def save_metrics(path, metrics: dict[str, pd.DataFrame], hist=None):
     out = {k: v.to_dict(orient="list") for k, v in metrics.items()}
-    if hist is not None: out["_history"] = hist
-    with open(path, "w") as f: json.dump(out, f)
+    if hist is not None:
+        out["_history"] = hist
+    with open(path, "w") as f:
+        json.dump(out, f)
 
 
 def load_metrics(path) -> dict[str, pd.DataFrame]:
-    with open(path) as f: raw = json.load(f)
+    with open(path) as f:
+        raw = json.load(f)
     return {k: pd.DataFrame(v) for k, v in raw.items() if not k.startswith("_")}
 
 
-# ----------------------------------------------------------------------- experiments
+# Experiments
 def midnight_predictions(model, pool: Pool) -> dict[str, np.ndarray]:
     """Day-ahead forecasts issued at 00:00 of every test day (for plots)."""
     out = {}
@@ -342,18 +378,21 @@ def midnight_predictions(model, pool: Pool) -> dict[str, np.ndarray]:
         sel = d.hourly.index[d.t0["test"]].hour == 0
         t0 = d.t0["test"][sel]
         s = ((d.static["test"][sel] - pool.static_mu) / pool.static_sd).astype(np.float32)
-        out[d.name] = np.stack([t0.astype(np.float32),
-                                *predict(model, pool, torch.from_numpy(t0 + o).long(), torch.from_numpy(s)).T], 1)
+        out[d.name] = np.stack(
+            [t0.astype(np.float32), *predict(model, pool, torch.from_numpy(t0 + o).long(), torch.from_numpy(s)).T], 1
+        )
     return out
 
 
-def run_experiment(tag, series: list[SeriesData], use_cal: bool, static_mode="none",
-                   results_dir="results", retrain=False, **kw):
+def run_experiment(
+    tag, series: list[SeriesData], use_cal: bool, static_mode="none", results_dir="results", retrain=False, **kw
+):
     """Train + evaluate one configuration; cached in results_dir/<tag>.json (+ .npz, .pt)."""
     os.makedirs(results_dir, exist_ok=True)
     base = os.path.join(results_dir, tag)
     if os.path.exists(base + ".json") and not retrain:
-        with open(base + ".json") as f: raw = json.load(f)
+        with open(base + ".json") as f:
+            raw = json.load(f)
         metrics = {k: pd.DataFrame(v) for k, v in raw.items() if not k.startswith("_")}
         preds = dict(np.load(base + ".npz"))
         return metrics, raw["_history"], preds
@@ -365,9 +404,14 @@ def run_experiment(tag, series: list[SeriesData], use_cal: bool, static_mode="no
     preds = midnight_predictions(model, pool)
     out = {k: v.to_dict(orient="list") for k, v in metrics.items()}
     out["_history"] = hist
-    out["_meta"] = {"static_mode": static_mode, "use_cal": use_cal, "seconds": time.time() - t,
-                    "n_params": sum(p.numel() for p in model.parameters())}
-    with open(base + ".json", "w") as f: json.dump(out, f)
+    out["_meta"] = {
+        "static_mode": static_mode,
+        "use_cal": use_cal,
+        "seconds": time.time() - t,
+        "n_params": sum(p.numel() for p in model.parameters()),
+    }
+    with open(base + ".json", "w") as f:
+        json.dump(out, f)
     np.savez_compressed(base + ".npz", **preds)
     torch.save(model.state_dict(), base + ".pt")
     print(f"[{tag}] done in {time.time()-t:.0f}s", flush=True)
